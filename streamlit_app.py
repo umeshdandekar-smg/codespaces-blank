@@ -254,10 +254,13 @@ def generate_substrate_code() -> None:
             if response_generator:
                 #print(f"response_generator is {response_generator}")
                 full_resp_for_one_cloud = "".join(response_generator)
-                print(f"full response for {cloud_type} is {full_resp_for_one_cloud}")
+                print(f"Obtained full response for {cloud_type}")
+                output_path = input(f"Enter the absolute output path that will contain {cloud_type}.out substrate: ")
+                #print(f"full response for {cloud_type} is {full_resp_for_one_cloud}")
                 # open an output file called <cloud_type>.out
                 # and dump the contents to that file
-                with open(f"{cloud_type}.out", "w", encoding="utf-8") as file:
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                with open(f"{output_path}/{cloud_type}.out", "w", encoding="utf-8") as file:
                     file.write(full_resp_for_one_cloud)
       
 st.title("Welcome to the Cloud Abstrator")
