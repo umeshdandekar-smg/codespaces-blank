@@ -1,0 +1,12 @@
+name: myQueue
+size: 262144
+metadata: "project: cloud-abstractor, env: dev"
+type: standard             # Available options: standard, FIFO
+number_of_retries: 5
+dlq_name: myDLQ
+visibility_timeout: 30
+substrates:
+  - AWS
+  - Azure
+  - GCP
+  - OCI

@@ -1,0 +1,214 @@
+Here is the Azure Terraform configuration to provision a Service Bus Standard queue that matches your YAML, along with Python sample code using the azure-servicebus SDK to interact with the queue.
+
+Important note about DLQ
+- In Azure Service Bus, the Dead-Letter Queue is a system sub-queue named a Dead-Letter subqueue (accessible as <queue>/-$DeadLetterQueue). It cannot be renamed to a custom name like myDLQ. If you need a separately named queue for dead-lettering, you would implement a separate consumer that forwards or processes messages accordingly. The Terraform below enables DLQ behavior via the queue's delivery controls, and the DLQ will be accessible as the built-in $DeadLetterQueue for your main queue.
+
+YAML mapping and assumptions
+- name: myQueue -> main queue name
+- type: standard -> Service Bus Standard tier
+- number_of_retries: 5 -> max_delivery_count (after 5 failed deliveries, message goes to the DLQ)
+- visibility_timeout: 30 -> lock_duration for the queue (PT30S)
+- dlq_name: myDLQ -> not renameable for Service Bus DLQ; documented in code comments
+- size, metadata, substrates: not directly applicable to provisioning; ignored in the Terraform code (size is not a queue property; metadata is informational)
+
+1) Terraform: provision Azure Service Bus namespace and queue (Standard, with DLQ support)
+
+File: main.tf
+--------------------------------------------
+provider "azurerm" {
+  features = {}
+}
+
+variable "name" {
+  description = "Base name for resources (used for queue and namespace)"
+  type        = string
+}
+
+variable "location" {
+  description = "Azure region for resources"
+  type        = string
+  default     = "East US"
+}
+
+variable "resource_group" {
+  description = "Resource group name"
+  type        = string
+  default     = "" # you can override with -var resource_group="your-rg"
+}
+
+variable "number_of_retries" {
+  description = "Maximum delivery attempts before dead-lettering"
+  type        = number
+  default     = 5
+}
+
+variable "visibility_timeout" {
+  description = "Queue lock duration in seconds"
+  type        = number
+  default     = 30
+}
+
+# Derive resource names
+locals {
+  rg_name       = var.resource_group != "" ? var.resource_group : "rg-${var.name}"
+  namespace_rx  = "sb-${var.name}"
+  queue_name    = var.name
+}
+
+# Resource group
+resource "azurerm_resource_group" "rg" {
+  name     = local.rg_name
+  location = var.location
+}
+
+# Service Bus Namespace (Standard tier)
+resource "azurerm_servicebus_namespace" "ns" {
+  name                = local.namespace_rx
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  sku_name            = "Standard"
+}
+
+# Service Bus Queue
+resource "azurerm_servicebus_queue" "queue" {
+  name                             = local.queue_name
+  namespace_name                   = azurerm_servicebus_namespace.ns.name
+  resource_group_name              = azurerm_resource_group.rg.name
+  max_delivery_count               = var.number_of_retries
+  lock_duration                    = "PT${var.visibility_timeout}S" # ISO 8601 duration, e.g., PT30S
+  requires_session                 = false
+  dead_lettering_on_message_expiration = true
+  # Note: DLQ for Service Bus is the built-in $DeadLetterQueue sub-queue. The user-provided dlq_name in YAML cannot rename this built-in DLQ.
+  # If you need to forward to a separate queue, consider using the forward_to property with another queue.
+}
+
+# Authorization rule to obtain connection string
+resource "azurerm_servicebus_namespace_authorization_rule" "auth" {
+  name                = "root"
+  namespace_name      = azurerm_servicebus_namespace.ns.name
+  resource_group_name = azurerm_resource_group.rg.name
+  rights              = ["Listen", "Send", "Manage"]
+}
+
+# Outputs
+output "servicebus_connection_string" {
+  value       = azurerm_servicebus_namespace_authorization_rule.auth.primary_connection_string
+  description = "Connection string for the Service Bus namespace/queue (for client apps)."
+}
+
+output "servicebus_queue_name" {
+  value       = azurerm_servicebus_queue.queue.name
+  description = "Provisioned queue name."
+}
+--------------------------------------------
+
+Notes for Terraform usage
+- Replace resource_group, location, and name values via -var or a tfvars file as appropriate for your environment.
+- The generated connection string (output servicebus_connection_string) is what you’ll use in the Python client.
+- The DLQ behavior is enabled via max_delivery_count; the DLQ itself is the built-in $DeadLetterQueue for the main queue. A separate named DLQ (myDLQ) cannot be created as the DLQ, but you can implement forwarding or separate handling if you need a custom dead-letter workflow.
+
+2) Python: interact with the queue using azure-servicebus
+
+File: queue_client.py
+--------------------------------------------
+import os
+import sys
+import time
+import yaml
+
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
+
+def load_config(yaml_path):
+    with open(yaml_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def create_client(connection_string):
+    return ServiceBusClient.from_connection_string(connection_string)
+
+def add_message(client, queue_name, content, ttl_seconds=None):
+    with client.get_queue_sender(queue_name) as sender:
+        msg = ServiceBusMessage(content)
+        if ttl_seconds is not None:
+            msg.time_to_live = ttl_seconds
+        sender.send_messages(msg)
+    print(f"Message added to queue '{queue_name}': {content}")
+
+def get_message(client, queue_name, max_wait_time=5):
+    with client.get_queue_receiver(queue_name, max_wait_time=max_wait_time) as receiver:
+        received_msgs = receiver.receive_messages(max_message_count=1, max_wait_time=max_wait_time)
+        for msg in received_msgs:
+            content = str(msg)
+            print(f"Received message from queue '{queue_name}': {content}")
+            # Complete (delete) the message from the queue
+            receiver.complete_message(msg)
+            return content
+    print(f"No messages available in queue '{queue_name}' within wait time {max_wait_time}s.")
+    return None
+
+def renew_lock(client, queue_name, message):
+    # Renew the lock on a currently-in-flight message to extend its visibility.
+    # Note: This requires you to have the message object from a prior receive.
+    with client.get_queue_receiver(queue_name, max_wait_time=5) as receiver:
+        try:
+            receiver.renew_message_lock(message)
+            print(f"Lock renewed for message in queue '{queue_name}'.")
+        except Exception as e:
+            print(f"Failed to renew lock: {e}")
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python queue_client.py <path_to_yaml_config>")
+        sys.exit(1)
+
+    config_path = sys.argv[1]
+    config = load_config(config_path)
+
+    # YAML mapping
+    queue_name = config.get("name")
+    # size is ignored (not a queue property for Service Bus or Storage Queue)
+    number_of_retries = int(config.get("number_of_retries", 5))
+    visibility_timeout = int(config.get("visibility_timeout", 30))
+    dlq_name = config.get("dlq_name", "myDLQ")  # Note: DLQ cannot be renamed in Service Bus
+
+    # Connect using environment variable
+    connection_string = os.environ.get("AZURE_SERVICE_BUS_CONNECTION_STRING")
+    if not connection_string:
+        raise SystemExit("Environment variable AZURE_SERVICE_BUS_CONNECTION_STRING is not set.")
+
+    client = create_client(connection_string)
+
+    # Example operations
+    add_message(client, queue_name, "Hello from Terraform-provisioned queue!", ttl_seconds=None)
+
+    # Get a message (and delete it)
+    _ = get_message(client, queue_name, max_wait_time=5)
+
+    # Example: renewing lock would require a message object from receive_messages.
+    # Here we show how you would structure it if you keep a reference to a message:
+    # message = ...  # obtained from get_message or receive_messages
+    # renew_lock(client, queue_name, message)
+
+if __name__ == "__main__":
+    main()
+--------------------------------------------
+
+How to run
+- Terraform:
+  - Ensure you have Azure credentials configured (e.g., via az login and a service principal if used in automation).
+  - Initialize and apply:
+    - terraform init
+    - terraform apply -var="name=myQueue" -var="location=eastus" -var="resource_group=myQueue-rg" -var="number_of_retries=5" -var="visibility_timeout=30"
+  - After apply, the output servicebus_connection_string will contain the connection string for code usage.
+
+- Python:
+  - Install dependencies: pip install azure-servicebus pyyaml
+  - Export connection string:
+    - export AZURE_SERVICE_BUS_CONNECTION_STRING="<your-connection-string>"
+  - Run the script with your YAML config:
+    - python queue_client.py path/to/your_config.yaml
+
+Notes and caveats
+- The DLQ (dead-letter queue) in Azure Service Bus is automatically created per queue as a sub-queue named <queue>/$DeadLetterQueue. It cannot be renamed to myDLQ. If you explicitly need a separately named DLQ, you’d need a custom workflow (e.g., a separate queue and a processor that forwards or copies messages to that queue on failure).
+- The YAML’s size field is not applicable to Azure Service Bus queue provisioning. The Terraform and Python code ignore this field.
+- The Python code demonstrates basic add and get/delete operations and shows where to renew message locks to extend visibility. The renew lock mechanism requires a message instance obtained from a receive operation; it’s not possible to set an arbitrary new visibility timeout in a single operation on an in-flight message beyond renewing the lock.
+- If you prefer to provision a Storage Queue instead of Service Bus, I can generate an alternative Terraform and Python example using azure-storage-queue with similar semantics (though DLQ behavior would not be built-in there). Just say the word.
