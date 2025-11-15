@@ -1,0 +1,233 @@
+Here are the Terraform and Python code pieces derived from your YAML to provision a GCP Pub/Sub queue (topic + subscription with DLQ) and provide Python interactions (publish, pull/get, delete, change visibility, and update retries).
+
+Terraform (main.tf)
+- Creates the main topic (myQueue) and a DLQ topic (myDLQ).
+- Creates a subscription (myQueue-sub) with ack_deadline_seconds = 30 and a dead_letter_policy pointing to myDLQ with max_delivery_attempts = 5.
+- Includes environment tagging via labels.
+
+Note: The size parameter is not used by Pub/Sub; it’s ignored in this provisioning.
+
+Terraform configuration (main.tf):
+
+# Terraform configuration for GCP Pub/Sub queue and DLQ
+
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+  required_version = ">= 0.13"
+}
+
+provider "google" {
+  project = "cloud-abstractor"
+  # credentials = file("<path-to-service-account-key>.json")  # optional
+  # Pub/Sub is a global resource; region is not strictly required
+}
+
+# Topic representing the main queue
+resource "google_pubsub_topic" "my_queue_topic" {
+  name   = "myQueue"
+  labels = {
+    env     = "dev"
+    project = "cloud-abstractor"
+  }
+
+  # Standard type requires no ordering. If FIFO is chosen, set enable_message_ordering = true.
+  enable_message_ordering = false
+}
+
+# Dead-letter topic
+resource "google_pubsub_topic" "my_dlq_topic" {
+  name   = "myDLQ"
+  labels = {
+    env     = "dev"
+    project = "cloud-abstractor"
+  }
+}
+
+# Subscription for the queue with DLQ and visibility timeout
+resource "google_pubsub_subscription" "my_queue_subscription" {
+  name  = "myQueue-sub"
+
+  # Link to the main topic
+  topic = google_pubsub_topic.my_queue_topic.id
+
+  # Visibility timeout in seconds
+  ack_deadline_seconds = 30
+
+  # Dead-letter configuration: deliver to myDLQ after 5 delivery attempts
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.my_dlq_topic.id
+    max_delivery_attempts = 5
+  }
+
+  labels = {
+    env     = "dev"
+    project = "cloud-abstractor"
+  }
+
+  # Not enabling message ordering at the subscription level; ordering is topic-level if needed
+}
+
+# Outputs (optional)
+output "topic_name" {
+  value = google_pubsub_topic.my_queue_topic.name
+}
+output "subscription_name" {
+  value = google_pubsub_subscription.my_queue_subscription.name
+}
+output "dlq_topic_name" {
+  value = google_pubsub_topic.my_dlq_topic.name
+}
+
+Python code (pubsub_queue.py)
+- Uses google-cloud-pubsub SDK to interact with the queue (publish, pull/get, ack/delete, modify acknowledgement deadline, and update dead-letter retry count).
+- Assumes credentials are available in the environment (e.g., GOOGLE_APPLICATION_CREDENTIALS).
+
+pubsub_queue.py:
+
+from google.cloud import pubsub_v1
+from google.api_core.exceptions import NotFound, AlreadyExists
+from google.protobuf import field_mask_pb2
+
+# Configuration derived from YAML
+PROJECT_ID = "cloud-abstractor"
+TOPIC_ID = "myQueue"
+SUBSCRIPTION_ID = "myQueue-sub"
+DLQ_TOPIC_ID = "myDLQ"
+
+# Optional: determine FIFO/Standard, default to standard
+QUEUE_TYPE = "standard"  # or "FIFO"
+ENABLE_ORDERING = (QUEUE_TYPE.upper() == "FIFO")
+
+# Initialize clients
+publisher = pubsub_v1.PublisherClient()
+subscriber = pubsub_v1.SubscriberClient()
+
+topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
+subscription_path = subscriber.subscription_path(PROJECT_ID, SUBSCRIPTION_ID)
+dlq_topic_path = publisher.topic_path(PROJECT_ID, DLQ_TOPIC_ID)
+
+def ensure_topics_exist():
+    # Create main topic if not exists
+    try:
+        publisher.create_topic(request={"name": topic_path})
+        print(f"Created topic: {TOPIC_ID}")
+    except AlreadyExists:
+        print(f"Topic {TOPIC_ID} already exists.")
+
+    # Create DLQ topic if not exists
+    try:
+        publisher.create_topic(request={"name": dlq_topic_path})
+        print(f"Created DLQ topic: {DLQ_TOPIC_ID}")
+    except AlreadyExists:
+        print(f"DLQ topic {DLQ_TOPIC_ID} already exists.")
+
+def publish_message(message_text: str) -> str:
+    # Publish a message to the main topic
+    data = message_text.encode("utf-8")
+    future = publisher.publish(topic_path, data)
+    message_id = future.result()
+    print(f"Published message ID: {message_id}")
+    return message_id
+
+def pull_message(max_messages: int = 1, timeout: int = 5):
+    # Pull messages synchronously from the subscription
+    response = subscriber.pull(
+        request={
+            "subscription": subscription_path,
+            "max_messages": max_messages,
+        },
+        timeout=timeout,
+    )
+
+    for received_message in response.received_messages:
+        msg = received_message.message
+        msg_text = msg.data.decode("utf-8")
+        print(f"Pulled message: {msg_text}")
+        # Return ack_id for potential further actions (delete/extend visibility)
+        yield {
+            "ack_id": received_message.ack_id,
+            "data": msg_text,
+        }
+
+def delete_message(ack_id: str):
+    # Acknowledge the message to remove it from the queue
+    subscriber.acknowledge(request={"subscription": subscription_path, "ack_ids": [ack_id]})
+    print(f"Acknowledged (deleted) message with ack_id: {ack_id}")
+
+def change_visibility_timeout(ack_id: str, new_seconds: int):
+    # Extend/shorten the ack deadline for a specific message
+    subscriber.modify_ack_deadline(
+        request={
+            "subscription": subscription_path,
+            "ack_ids": [ack_id],
+            "ack_deadline_seconds": new_seconds,
+        }
+    )
+    print(f"Changed visibility for ack_id {ack_id} to {new_seconds} seconds")
+
+def update_dead_letter_max_delivery_attempts(new_max_delivery_attempts: int):
+    # Update the dead-letter policy on the subscription (maximum delivery attempts)
+    subscription = pubsub_v1.types.Subscription(
+        name=subscription_path,
+        dead_letter_policy=pubsub_v1.types.DeadLetterPolicy(
+            dead_letter_topic=dlq_topic_path,
+            max_delivery_attempts=new_max_delivery_attempts,
+        ),
+    )
+    update_mask = field_mask_pb2.FieldMask(paths=["dead_letter_policy"])
+    updated = subscriber.update_subscription(request={"subscription": subscription, "update_mask": update_mask})
+    print(f"Updated dead-letter max_delivery_attempts to {new_max_delivery_attempts} for subscription {SUBSCRIPTION_ID}")
+    return updated
+
+if __name__ == "__main__":
+    # Example usage (uncomment to run):
+
+    # Ensure topics exist (create if missing)
+    # ensure_topics_exist()
+
+    # Publish a message
+    # publish_message("Hello, Pub/Sub!")
+
+    # Pull a message (example usage)
+    # for m in pull_message(max_messages=1, timeout=5):
+    #     print("Processing pulled message:", m)
+
+    # If you have an ack_id from pull_message, you can delete (ack) it:
+    # delete_message("<ACK_ID_FROM_PULL>")
+
+    # Change visibility timeout for a specific ack_id
+    # change_visibility_timeout("<ACK_ID_FROM_PULL>", 60)
+
+    # Update dead-letter max delivery attempts
+    # update_dead_letter_max_delivery_attempts(7)
+
+Notes and mappings from YAML to code
+- queue name: myQueue
+- DLQ name: myDLQ
+- visibility_timeout: 30 seconds -> ack_deadline_seconds on the subscription
+- number_of_retries: 5 -> max_delivery_attempts in dead_letter_policy
+- type: standard -> enable_message_ordering = false on the main topic
+- metadata/project/env used as labels on Terraform resources for traceability
+- size (262144) is not a Pub/Sub parameter; ignored in provisioning
+
+To use
+- Ensure Google Cloud credentials are available (e.g., environment variable GOOGLE_APPLICATION_CREDENTIALS or default credentials in your environment).
+- Run Terraform plan/apply to provision the resources:
+  - Initialize: terraform init
+  - Plan: terraform plan
+  - Apply: terraform apply
+
+- Run the Python script:
+  - Ensure the environment has google-cloud-pubsub installed (pip install google-cloud-pubsub)
+  - Optionally customize PROJECT_ID, TOPIC_ID, SUBSCRIPTION_ID, DLQ_TOPIC_ID in the script or wire them via environment variables.
+  - Run the script or call the functions as needed:
+    - publish_message("Your payload here")
+    - pull_message(...) and then delete_message(ack_id) or change_visibility_timeout(ack_id, new_seconds)
+    - update_dead_letter_max_delivery_attempts(new_max_delivery_attempts)
+
+If you want, I can tailor the Terraform and Python code to use variables for project, region, and names, or add a simple CLI to the Python script for easier interaction.

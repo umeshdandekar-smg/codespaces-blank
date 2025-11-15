@@ -1,0 +1,204 @@
+Here is AWS-specific code generated from your YAML. It provisions a standard SQS queue with a Dead-Letter Queue (DLQ) and provides Python code (Boto3) to interact with the queue.
+
+Notes on your YAML
+- size: 262144 bytes (256 KB). AWS SQS max message size is 256 KB, so this value aligns with the maximum. SQS does not allow configuring a larger per-message size.
+- type: standard -> standard (non-FIFO) queue.
+- number_of_retries: 5 -> maps to maxReceiveCount for the DLQ.
+- dlq_name: myDLQ -> DLQ name.
+- visibility_timeout: 30 seconds -> default visibility timeout for the main queue.
+
+Terraform (AWS SQS standard queue with DLQ)
+- Creates the DLQ (myDLQ) and the main queue (myQueue).
+- Sets the dead-letter policy with maxReceiveCount = 5.
+- Applies metadata as tags (project=cloud-abstractor, env=dev).
+
+Code (Terraform)
+---------------------------------
+# Terraform configuration (AWS)
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  required_version = ">= 0.13"
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+variable "aws_region" {
+  description = "AWS region to deploy resources"
+  type        = string
+  default     = "us-east-1"
+}
+
+# Dead-Letter Queue
+resource "aws_sqs_queue" "dlq" {
+  name = "myDLQ"
+
+  tags = {
+    project = "cloud-abstractor"
+    env     = "dev"
+  }
+}
+
+# Main queue (standard, with DLQ)
+resource "aws_sqs_queue" "main" {
+  name                        = "myQueue"
+  visibility_timeout_seconds  = 30
+
+  # Redrive policy to send failed messages to the DLQ after 5 receives
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = 5
+  })
+
+  tags = {
+    project = "cloud-abstractor"
+    env     = "dev"
+  }
+}
+
+# Outputs
+output "main_queue_url" {
+  description = "URL of the main SQS queue"
+  value       = aws_sqs_queue.main.url
+}
+
+output "main_queue_arn" {
+  description = "ARN of the main SQS queue"
+  value       = aws_sqs_queue.main.arn
+}
+
+output "dlq_url" {
+  description = "URL of the Dead-Letter Queue"
+  value       = aws_sqs_queue.dlq.url
+}
+
+output "dlq_arn" {
+  description = "ARN of the Dead-Letter Queue"
+  value       = aws_sqs_queue.dlq.arn
+}
+
+# Note: The provided size (262144 bytes) is the maximum per-message size for SQS.
+# SQS does not provide a separate configuration for queue size or per-queue message limits beyond this.
+---------------------------------
+
+Python (Boto3) to interact with the queue
+- Provides functions to send, receive, delete, and change visibility timeout.
+- Includes a simple example showing how to send and process a message.
+
+Code (Python - boto3)
+---------------------------------
+#!/usr/bin/env python3
+"""
+SQS interaction utilities using boto3.
+
+Assumptions:
+- AWS credentials are configured in the environment (e.g., AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+  or through an AWS profile.
+- The queue name is "myQueue" as defined in the Terraform example.
+"""
+
+import json
+import boto3
+from botocore.exceptions import ClientError
+
+def get_queue_url(queue_name: str, region_name: str = None) -> str:
+    """Return the URL for a given queue name."""
+    client = boto3.client('sqs', region_name=region_name)
+    try:
+        resp = client.get_queue_url(QueueName=queue_name)
+        return resp['QueueUrl']
+    except ClientError as e:
+        print(f"Error getting queue URL for '{queue_name}': {e}")
+        raise
+
+def send_message(queue_name: str, message_body: str, region_name: str = None, delay_seconds: int = 0) -> dict:
+    """Send a message to the queue."""
+    url = get_queue_url(queue_name, region_name)
+    client = boto3.client('sqs', region_name=region_name)
+    response = client.send_message(
+        QueueUrl=url,
+        MessageBody=message_body,
+        DelaySeconds=delay_seconds
+    )
+    return response
+
+def receive_message(queue_name: str, max_number_of_messages: int = 1, wait_time_seconds: int = 5, region_name: str = None) -> list:
+    """Receive messages from the queue."""
+    url = get_queue_url(queue_name, region_name)
+    client = boto3.client('sqs', region_name=region_name)
+    resp = client.receive_message(
+        QueueUrl=url,
+        MaxNumberOfMessages=max_number_of_messages,
+        WaitTimeSeconds=wait_time_seconds
+    )
+    return resp.get('Messages', [])
+
+def delete_message(queue_name: str, receipt_handle: str, region_name: str = None) -> None:
+    """Delete a processed message from the queue using its receipt handle."""
+    url = get_queue_url(queue_name, region_name)
+    client = boto3.client('sqs', region_name=region_name)
+    client.delete_message(QueueUrl=url, ReceiptHandle=receipt_handle)
+
+def change_visibility_timeout(queue_name: str, receipt_handle: str, visibility_timeout: int, region_name: str = None) -> None:
+    """Change the visibility timeout for a received message."""
+    url = get_queue_url(queue_name, region_name)
+    client = boto3.client('sqs', region_name=region_name)
+    client.change_message_visibility(
+        QueueUrl=url,
+        ReceiptHandle=receipt_handle,
+        VisibilityTimeout=visibility_timeout
+    )
+
+def main():
+    queue_name = "myQueue"
+
+    # Example: send a test message
+    print("Sending a test message...")
+    send_resp = send_message(queue_name, "Hello from Terraform + Python (boto3)")
+    print("MessageId:", send_resp.get("MessageId"))
+
+    # Example: receive messages
+    print("Receiving messages...")
+    messages = receive_message(queue_name, max_number_of_messages=1, wait_time_seconds=5)
+    if not messages:
+        print("No messages received.")
+        return
+
+    for msg in messages:
+        body = msg.get("Body")
+        receipt = msg.get("ReceiptHandle")
+        print("Received message:", body)
+        # Process the message here...
+
+        # Delete after processing
+        delete_message(queue_name, receipt)
+        print("Message deleted.")
+
+if __name__ == "__main__":
+    main()
+---------------------------------
+
+How to run
+- Terraform:
+  - Ensure AWS credentials are configured.
+  - Optionally set AWS_REGION (defaults to us-east-1 in the config).
+  - Run:
+    - terraform init
+    - terraform apply
+  - Note: The DLQ and main queue will be created with the specified names, tags, and redrive policy.
+
+- Python (boto3):
+  - Install boto3 if needed: pip install boto3
+  - Ensure AWS credentials/region are configured (environment variables, AWS config file, or instance role).
+  - Run the script:
+    - python your_script_name.py
+  - The script demonstrates sending, receiving, and deleting a message from the queue.
+
+If you want, I can tailor the Terraform provider version, region, or add more features (e.g., tags from a YAML-driven input, environment-based naming, or exporting additional attributes).

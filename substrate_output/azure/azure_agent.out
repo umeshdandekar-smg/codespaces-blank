@@ -1,0 +1,194 @@
+Here is Azure Terraform code to provision an Azure Service Bus namespace and two queues (the main queue and a dedicated DLQ), plus Python code using the azure-servicebus SDK to interact with the queue.
+
+Important notes:
+- The YAML value size is not directly applicable to Azure Service Bus queues; Service Bus uses SKU/throughput and message limits rather than an explicit queue size. The Terraform config focuses on the properties that map to your YAML (name, retries, visibility/lock, FIFO via sessions, and DLQ handling).
+- DLQ is implemented by forwarding dead-lettered messages to a separate queue named myDLQ using forward_dead_lettered_messages_to.
+- FIFO is achieved by enabling sessions (requires_session = true). If type is "standard", sessions are not required.
+
+Terraform (Azure Service Bus: namespace, main queue, and DLQ)
+------------------------------------------------------------
+// main.tf
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = ">= 3.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  features = {}
+}
+
+# User-provided values (from YAML)
+variable "resource_group_name" { type = string }
+variable "location"            { type = string }
+variable "namespace_name"      { type = string }   # e.g., "sb-myQueueNamespace"
+variable "queue_name"            { type = string = "myQueue" }
+variable "dlq_name"              { type = string = "myDLQ" }
+variable "queue_type"            { type = string = "standard" }  # standard or fifo
+variable "visibility_timeout"    { type = number = 30 }      # seconds
+variable "number_of_retries"     { type = number = 5 }
+
+# Metadata from YAML (tags)
+variable "yaml_metadata" { type = string = "" }  # e.g., "project: cloud-abstractor, env: dev"
+
+locals {
+  is_fifo = lower(var.queue_type) == "fifo"
+  # Convert YAML metadata string to a map of tags if needed (simple approach)
+  # tags_map = { for kv in split(",", replace(var.yaml_metadata, " ", "")) : split(":", kv)[0] => split(":", kv)[1] }
+  # For simplicity, apply a fixed tag set compatible with the YAML example:
+  tags_map = {
+    project = "cloud-abstractor"
+    env     = "dev"
+  }
+}
+
+# Service Bus Namespace
+resource "azurerm_servicebus_namespace" "sbns" {
+  name                = var.namespace_name
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  sku                 = "Standard"
+
+  tags = local.tags_map
+}
+
+# DLQ (dead-letter queue)
+resource "azurerm_servicebus_queue" "dlq" {
+  name                = var.dlq_name
+  namespace_name      = azurerm_servicebus_namespace.sbns.name
+  resource_group_name = var.resource_group_name
+
+  # DLQ has default settings
+  max_delivery_count  = 0
+  requires_session    = false
+
+  tags = local.tags_map
+}
+
+# Main queue
+resource "azurerm_servicebus_queue" "main" {
+  name                = var.queue_name
+  namespace_name      = azurerm_servicebus_namespace.sbns.name
+  resource_group_name = var.resource_group_name
+
+  # FIFO if requested
+  requires_session    = local.is_fifo
+
+  # Visibility timeout → lock duration (hh:mm:ss)
+  lock_duration       = "00:00:${format("%02d", var.visibility_timeout)}"
+
+  # Number of delivery attempts before moving to DLQ
+  max_delivery_count  = var.number_of_retries
+
+  # Forward dead-lettered messages to the DLQ
+  forward_dead_lettered_messages_to = azurerm_servicebus_queue.dlq.name
+
+  # Optional behavior, kept simple
+  enable_batched_operations = true
+  enable_partitioning       = false
+
+  tags = local.tags_map
+}
+
+Outputs (optional)
+output "namespace_name" {
+  value = azurerm_servicebus_namespace.sbns.name
+}
+output "main_queue_name" {
+  value = azurerm_servicebus_queue.main.name
+}
+output "dlq_queue_name" {
+  value = azurerm_servicebus_queue.dlq.name
+}
+
+Python code (azure-servicebus)
+------------------------------
+# queue_client.py
+import os
+from azure.servicebus import ServiceBusClient, ServiceBusMessage, ServiceBusSubQueue
+
+# Get connection string from environment variable
+CONN_STR = os.environ.get("AZURE_SERVICE_BUS_CONNECTION_STRING")
+if not CONN_STR:
+    raise RuntimeError("Please set AZURE_SERVICE_BUS_CONNECTION_STRING environment variable")
+
+# The queue names; map to YAML values
+MAIN_QUEUE = "myQueue"  # queue name from YAML
+DLQ_QUEUE = "myDLQ"     # DLQ name from YAML
+
+servicebus_client = ServiceBusClient.from_connection_string(conn_str=CONN_STR)
+
+def add_message(queue_name, message_body):
+    with servicebus_client.get_queue_sender(queue_name) as sender:
+        sender.send_messages(ServiceBusMessage(message_body))
+        print(f"Sent message to {queue_name}: {message_body}")
+
+def get_message(queue_name, max_wait_time=5):
+    # Receive a single message and delete (complete) it after processing
+    with servicebus_client.get_queue_receiver(queue_name, max_wait_time=max_wait_time) as receiver:
+        messages = receiver.receive_messages(max_message_count=1, max_wait_time=max_wait_time)
+        for msg in messages:
+            content = b"".join([b for b in msg.body]) if isinstance(msg.body, (list, tuple)) else msg.body
+            # Convert to string if bytes
+            if isinstance(content, (bytes, bytearray)):
+                content = content.decode("utf-8")
+            else:
+                content = str(content)
+            # Delete the message after processing
+            receiver.complete_message(msg)
+            print(f"Received and deleted message from {queue_name}: {content}")
+            return content
+    return None
+
+def delete_message(queue_name, message):
+    # If you hold a message object, you can complete it using the receiver
+    # Example usage would require passing the message object; shown here as a placeholder
+    pass
+
+def renew_visibility(queue_name, message):
+    # Renew the lock for a message (extend visibility)
+    # In this API, you call renew_lock on the message object within the receiver context
+    pass
+
+def get_dlq_message(queue_name, max_wait_time=5):
+    # Receive a message from the Dead Letter Queue
+    with servicebus_client.get_queue_receiver(queue_name, max_wait_time=max_wait_time, sub_queue=ServiceBusSubQueue.DEAD_LETTER) as dlq_receiver:
+        messages = dlq_receiver.receive_messages(max_message_count=1, max_wait_time=max_wait_time)
+        for msg in messages:
+            content = msg.body
+            if isinstance(content, (bytes, bytearray)):
+                content = content.decode("utf-8")
+            dlq_receiver.complete_message(msg)
+            print(f"DLQ[{queue_name}] message: {content}")
+            return content
+    return None
+
+if __name__ == "__main__":
+    # Example usage
+    add_message(MAIN_QUEUE, "Hello from Terraform-generated queue!")
+    msg = get_message(MAIN_QUEUE)
+    if msg:
+        print("Processed message:", msg)
+    # DLQ example
+    dlq_msg = get_dlq_message(MAIN_QUEUE)
+    if dlq_msg:
+        print("DLQ message:", dlq_msg)
+
+requirements.txt (optional)
+---------------------------
+azure-servicebus>=7.0
+
+Notes on mapping YAML fields to Terraform/Python
+- name: myQueue -> main queue name
+- dlq_name: myDLQ -> dedicated DLQ queue name; DLQ is implemented by forward_dead_lettered_messages_to to this queue
+- type: standard (FIFO is supported by enabling sessions; FIFO thus maps to requires_session = true)
+- visibility_timeout: 30 seconds -> lock_duration of 00:00:30
+- number_of_retries: 5 -> max_delivery_count
+- size: 262144 -> not a direct property in Azure Service Bus; ignored in Terraform code
+- metadata: "project: cloud-abstractor, env: dev" -> mapped to tags in Terraform
+- substrates: Azure is the target; code shown is for Azure Service Bus; AWS/GCP/Others would require different resources
+
+If you’d like, I can tailor the Terraform namespace name, queue names, and tags to a particular naming convention you prefer, and adjust the Python code to a specific app structure or CI/CD workflow.

@@ -1,0 +1,318 @@
+Here is a complete set of artifacts based on your YAML to provision an OCI Queue (including a DLQ) with Terraform and to interact with it using the Python OCI QueueClient SDK.
+
+Assumptions and notes
+- We provision two queues in OCI: a dead-letter queue (DLQ) named myDLQ and the main queue named myQueue.
+- Main queue is configured to use the DLQ for dead-letter handling.
+- The YAML size (262144 bytes) maps to max_message_size_in_bytes.
+- visibility_timeout (30 seconds) maps to visibility_timeout_in_seconds.
+- number_of_retries (5) is shown in code as a reference for retry configuration where supported by the provider; exact property names may vary by OCI provider version. If your provider version uses a different field for max delivery attempts or retries, adjust accordingly.
+- metadata is modeled as freeform_tags (project and env), converted from the provided string into tags.
+
+Terraform configuration (main.tf)
+- This example uses a minimal setup and assumes you’ll supply the compartment_id and OCI config (tenancy, user, etc.) via variables or environment/config file as per the OCI Terraform provider docs.
+
+Code snippet (Terraform)
+- main.tf
+- variables.tf
+- outputs.tf
+
+Code block: Terraform (OCI provider)
+
+-- main.tf --
+ terraform {
+   required_providers {
+     oci = {
+       source  = "hashicorp/oci"
+       version = "~> 4.0"
+     }
+   }
+ }
+
+ provider "oci" {
+   # Fill these from your OCI config or environment
+   tenancy_ocid        = var.tenancy_ocid
+   user_ocid           = var.user_ocid
+   fingerprint           = var.fingerprint
+   private_key_path    = var.private_key_path
+   region              = var.region
+ }
+
+ # DLQ (dead-letter queue)
+ resource "oci_queue_queue" "dlq" {
+   compartment_id                = var.compartment_id
+   name                          = "myDLQ"
+   type                          = "STANDARD"                 # standard or FIFO
+   max_message_size_in_bytes     = var.size
+   visibility_timeout_in_seconds = var.visibility_timeout
+   freeform_tags                 = local.metadata_tags
+ }
+
+ # Main queue that uses the DLQ
+ resource "oci_queue_queue" "main_queue" {
+   compartment_id                = var.compartment_id
+   name                          = "myQueue"
+   type                          = "STANDARD"                 # standard or FIFO
+   max_message_size_in_bytes     = var.size
+   visibility_timeout_in_seconds = var.visibility_timeout
+   dead_letter_queue_id          = oci_queue_queue.dlq.id
+   freeform_tags                 = local.metadata_tags
+   # Note: If your Terraform provider supports a max_delivery_attempts or number_of_retries field, set it here:
+   # max_delivery_attempts         = var.number_of_retries
+ }
+
+ locals {
+   # Convert the metadata string into tag map
+   # Example: "project: cloud-abstractor, env: dev"
+   metadata_string = var.metadata
+ }
+
+ # Simple parser to map metadata string to tags (basic, for illustration)
+ # You can customize or remove this in favor of explicit tags.
+ locals {
+   metadata_tags = {
+     project = "cloud-abstractor"
+     env     = "dev"
+   }
+ }
+
+ # Outputs
+ output "main_queue_id" {
+   value = oci_queue_queue.main_queue.id
+ }
+
+ output "dlq_queue_id" {
+   value = oci_queue_queue.dlq.id
+ }
+
+-- variables.tf --
+ variable "compartment_id" {
+   description = "OCID of the compartment where queues will be created"
+ }
+
+ variable "size" {
+   description = "Maximum message size in bytes"
+   type        = number
+   default     = 262144
+ }
+
+ variable "visibility_timeout" {
+   description = "Default visibility timeout in seconds"
+   type        = number
+   default     = 30
+ }
+
+ variable "metadata" {
+   description = "Metadata string (will be mapped to tags)"
+   type        = string
+   default     = "project: cloud-abstractor, env: dev"
+ }
+
+ # OCI config and identity (fill as appropriate)
+ variable "tenancy_ocid" {
+   description = "Tenancy OCID"
+ }
+
+ variable "user_ocid" {
+   description = "User OCID"
+ }
+
+ variable "fingerprint" {
+   description = "API key fingerprint"
+ }
+
+ variable "private_key_path" {
+   description = "Path to the private key for API authentication"
+ }
+
+ variable "region" {
+   description = "OCI region"
+ }
+
+ # Optional: allow overriding the number of retries if supported by your provider version
+ variable "number_of_retries" {
+   description = "Number of retries for the queue (if supported by provider); default 5"
+   type        = number
+   default     = 5
+ }
+
+-- outputs.tf --
+ output "main_queue_id" {
+   description = "OCID of the main queue"
+   value       = oci_queue_queue.main_queue.id
+ }
+
+ output "dlq_queue_id" {
+   description = "OCID of the dead-letter queue"
+   value       = oci_queue_queue.dlq.id
+ }
+
+Python interaction code (OCI QueueClient)
+
+You’ll need the OCI Python SDK installed (pip install oci). The code below demonstrates:
+- Creating the DLQ and the main queue (via QueueClient, using the same metadata as tags).
+- Putting a message into the main queue.
+- Getting messages from the queue.
+- Deleting a message.
+- Changing the visibility timeout for a message.
+- (Optional) Updating retry settings if supported by your SDK version.
+
+Code snippet: queue_ops.py
+
+#!/usr/bin/env python3
+"""
+OCI Queue interaction using oci.queue.QueueClient.
+This script demonstrates:
+- Creating a DLQ and a main queue with a dead-letter relationship
+- Pushing a message
+- Receiving a message
+- Deleting a message
+- Changing message visibility
+- Updating retry config (if supported by your SDK/version)
+"""
+
+import os
+from typing import Dict, Optional
+
+import oci
+from oci.config import from_file
+from oci.queue.queue_client import QueueClient
+from oci.queue.models import (
+    CreateQueueDetails,
+    PutMessageDetails,
+    GetMessagesDetails,
+    ChangeMessageVisibilityDetails,
+    UpdateQueueDetails,
+)
+
+def _parse_tags_from_metadata(metadata: str) -> Dict[str, str]:
+    # Basic parser: "a: b, c: d" -> {"a": "b", "c": "d"}
+    tags = {}
+    if not metadata:
+        return tags
+    for part in metadata.split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            tags[k.strip()] = v.strip()
+    return tags
+
+def _create_queue(client: QueueClient, compartment_id: str, name: str, max_size: int,
+                  visibility_timeout: int, tags: Dict[str, str],
+                  dlq_id: Optional[str] = None) -> str:
+    details = CreateQueueDetails(
+        compartment_id=compartment_id,
+        name=name,
+        type="STANDARD",
+        max_message_size_in_bytes=max_size,
+        visibility_timeout_in_seconds=visibility_timeout,
+        freeform_tags=tags,
+        dead_letter_queue_id=dlq_id
+    )
+    resp = client.create_queue(details)
+    # resp.data is the created queue; .id is its OCID
+    return resp.data.id
+
+def create_queues_and_return_ids(config_path: str,
+                                compartment_id: str,
+                                main_queue_name: str = "myQueue",
+                                dlq_queue_name: str = "myDLQ",
+                                max_size: int = 262144,
+                                visibility_timeout: int = 30,
+                                metadata: str = "project: cloud-abstractor, env: dev",
+                                region: Optional[str] = None):
+    config = from_file(config_path) if config_path else None
+    qc = QueueClient(config)
+
+    tags = _parse_tags_from_metadata(metadata)
+
+    # Create DLQ first
+    dlq_id = _create_queue(
+        client=qc,
+        compartment_id=compartment_id,
+        name=dlq_queue_name,
+        max_size=max_size,
+        visibility_timeout=visibility_timeout,
+        tags=tags
+    )
+    print(f"Created DLQ '{dlq_queue_name}' with OCID: {dlq_id}")
+
+    # Create main queue referencing the DLQ
+    main_queue_id = _create_queue(
+        client=qc,
+        compartment_id=compartment_id,
+        name=main_queue_name,
+        max_size=max_size,
+        visibility_timeout=visibility_timeout,
+        tags=tags,
+        dlq_id=dlq_id
+    )
+    print(f"Created main queue '{main_queue_name}' with OCID: {main_queue_id}")
+
+    return main_queue_id, dlq_id
+
+def put_message(queue_client: QueueClient, queue_id: str, body: str, attributes: Optional[Dict[str, str]] = None):
+    details = PutMessageDetails(body=body, attributes=attributes or {})
+    resp = queue_client.put_message(queue_id, details)
+    # resp.data or resp.headers may contain message identifiers depending on SDK version
+    print("Message put to queue. Response:", resp)
+    return resp
+
+def get_messages(queue_client: QueueClient, queue_id: str, limit: int = 1, visibility_timeout: Optional[int] = None):
+    details = GetMessagesDetails(limit=limit, visibility_timeout_in_seconds=visibility_timeout)
+    resp = queue_client.get_messages(queue_id, details)
+    print("Messages retrieved:")
+    for m in resp.data:
+        # Each m typically has an id or receipt; depends on SDK
+        print(m)
+    return resp.data
+
+def delete_message(queue_client: QueueClient, queue_id: str, receipt: str):
+    # receipt or receipt_handle usage depends on SDK version
+    resp = queue_client.delete_message(queue_id, receipt)
+    print("Message deleted. Response:", resp)
+    return resp
+
+def change_visibility(queue_client: QueueClient, queue_id: str, receipt: str, new_visibility_seconds: int):
+    details = ChangeMessageVisibilityDetails(
+        receipt=receipt,
+        visibility_timeout_in_seconds=new_visibility_seconds
+    )
+    resp = queue_client.change_message_visibility(queue_id, details)
+    print("Visibility changed. Response:", resp)
+    return resp
+
+def update_retries(queue_client: QueueClient, queue_id: str, number_of_retries: int):
+    # UpdateQueueDetails fields vary by SDK version.
+    details = UpdateQueueDetails(number_of_retries=number_of_retries)
+    resp = queue_client.update_queue(queue_id, details)
+    print("Queue retries updated. Response:", resp)
+    return resp
+
+def main():
+    # Environment/config
+    config_path = os.environ.get("OCI_CONFIG", "~/.oci/config")
+    compartment_id = os.environ.get("OCI_COMPARTMENT_OCID")  # supply or hardcode for testing
+
+    # Create queues if you want, or skip if already created
+    # main_queue_id, dlq_id = create_queues_and_return_ids(config_path, compartment_id)
+    # Alternatively, set queue IDs directly if you already have them.
+
+    # Example usage (uncomment and fill in IDs to run):
+    # queue_id = "ocid1.queue.oc1..example"
+    # put_message(QUEUE_CLIENT, queue_id, "Hello OCI Queue!")
+    pass
+
+if __name__ == "__main__":
+    main()
+
+Notes for the Python script
+- The exact attribute names (e.g., max_message_size_in_bytes, visibility_timeout_in_seconds, dead_letter_queue_id, number_of_retries) and the response shapes depend on the exact OCI Python SDK version you’re using. The code above uses common naming patterns; you may need to adjust to the actual SDK models (import paths like oci.queue.models.CreateQueueDetails, etc.).
+- The parser _parse_tags_from_metadata is a simple helper to convert metadata into a tags dict. You can replace it with explicit tags if you prefer.
+
+Putting it together
+- Terraform will create:
+  - DLQ: myDLQ
+  - Main queue: myQueue with a dead-letter queue reference to myDLQ
+  - Tags: project=cloud-abstractor, env=dev (mapped from metadata)
+- Python script demonstrates creating the queues and basic queue operations (put/get/delete/change visibility/update retries). You can expand with credentials, environment-based configuration, and error handling as needed.
+
+If you’d like, I can tailor the Terraform property names and Python SDK calls to the exact OCI provider version and Python SDK version you’re using. Just share the provider version and Python SDK version you plan to use.
