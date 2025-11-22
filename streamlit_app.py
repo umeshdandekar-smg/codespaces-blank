@@ -228,45 +228,63 @@ def generate_substrate_code() -> None:
     msg_list=[]
 
     # Ask user to enter file path
-    file_path = input("Enter the YAML file path describing the queue: ")
+    file_path = st.file_uploader("Upload your YAML file", type=["yaml", "yml"])
 
-    if not os.path.exists(file_path):
-        raise FileNotFoundError("The specified file does not exist.")
-
-    # Read YAML file content as a string
-    with open(file_path, 'r', encoding='utf-8') as f:
-        user_input = f.read()
+    st.write(f"Uploaded file: {file_path.name if file_path else 'No file uploaded'}")
+    if file_path is None:
+        st.warning("Please upload a YAML file to proceed.")
+        return
+    
+    user_input = file_path.read().decode("utf-8")
 
     print(f"User input is {user_input}")
     # create YAML string to describe the input
 
-    msg_list.append({"role":"user","content":user_input})
-    app=ChatbotAgent(os.environ['OPEN_AI_KEY'])
-    thread_id = 10
-    thread={"configurable":{"thread_id":thread_id}}
-    full_resp = ""
-    for s in app.graph.stream({'messages': msg_list}, thread):
-        print(f"Inside the for loop in the app graph stream s contains {s}")
-        for key, value in s.items():
-            print(f"Key: {key}, Value: {value}")
-            cloud_type = key
-            response_generator = value.get("response")
-            if response_generator:
-                #print(f"response_generator is {response_generator}")
-                full_resp_for_one_cloud = "".join(response_generator)
-                print(f"Obtained full response for {cloud_type}")
-                output_path = input(f"Enter the absolute output path that will contain {cloud_type}.out substrate: ")
-                #print(f"full response for {cloud_type} is {full_resp_for_one_cloud}")
-                # open an output file called <cloud_type>.out
-                # and dump the contents to that file
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                with open(f"{output_path}/{cloud_type}.out", "w", encoding="utf-8") as file:
-                    file.write(full_resp_for_one_cloud)
-      
+    output_path = st.text_input(f"Enter the output path on the server that will contain output files:")
+    print(f"Output path is {output_path}")
+    if st.button("Generate substrate code") and file_path and output_path:
+        msg_list.append({"role":"user","content":user_input})
+        app=ChatbotAgent(os.environ['OPEN_AI_KEY'])
+        thread_id = 10
+        thread={"configurable":{"thread_id":thread_id}}
+        st.write("Generating substrate code, please wait...")
+        full_resp = ""
+        for s in app.graph.stream({'messages': msg_list}, thread):
+            #print(f"Inside the for loop in the app graph stream s contains {s}")
+            for key, value in s.items():
+                #print(f"Key: {key}, Value: {value}")
+                cloud_type = key
+                response_generator = value.get("response")
+                if response_generator:
+                    #print(f"response_generator is {response_generator}")
+                    full_resp_for_one_cloud = "".join(response_generator)
+                    print(f"Obtained full response for {cloud_type}")
+                
+                    st.write(f"Generated code for {cloud_type}")
+                    st.session_state["generated"][f"{output_path}/{cloud_type}.out"] = full_resp_for_one_cloud
+        
+        # exit the function after processing one time
+        return
+
+
+if "generated" not in st.session_state:
+    st.session_state["generated"] = {} 
 st.title("Welcome to the Cloud Abstrator")
 st.write(
     "We help you to abstract the cloud"
 )
 initialize_env()
 generate_substrate_code()
+
+# Show download buttons for any generated files (persistent across reruns)
+if st.session_state.get("generated"):
+    st.info("Note: the paths shown are the server-side suggested paths.\nClicking a Download button streams the file to your browser — the browser then saves it to your machine (typically `~/Downloads`).")
+    for fname, code in st.session_state["generated"].items():
+        st.write(f"Generated file (server path): `{fname}`")
+        st.caption("Click 'Download' to save a copy to your computer (browser decides the folder, usually `~/Downloads`).")
+        # use a unique key per file to avoid widget collisions
+        key = f"download_{fname}"
+        # present basename as the downloaded filename
+        download_name = os.path.basename(fname)
+        st.download_button(label=f"Download: {download_name}", data=code, file_name=download_name, key=key)
 
